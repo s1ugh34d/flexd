@@ -114,4 +114,4 @@ Access and error logs are written to the paths configured per-server
 
 ## License
 
-AGPL-3.0-only. See [LICENSE](LICENSE).
+AGPL-3.0-only. See [LICENSE](https://github.com/s1ugh34d/flexd/blob/main/LICENSE).

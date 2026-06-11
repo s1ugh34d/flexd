@@ -517,6 +517,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "webpki-roots 0.26.11",

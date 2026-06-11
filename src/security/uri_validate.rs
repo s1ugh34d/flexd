@@ -1,6 +1,26 @@
+//! Request-URI and header-value validation.
+//!
+//! Path-based access controls are only as good as the parser underneath them.
+//! [`validate_uri`](crate::security::uri_validate::validate_uri) rejects the
+//! encoding tricks attackers use to slip a traversal past naive normalization:
+//! NUL bytes, single- and double-encoded `../`, alternative and Unicode path
+//! separators, overlong UTF-8 sequences, invalid surrogate halves, and
+//! malformed percent-encoding (Invariants 25, 62, 63).
+//! [`has_control_chars`](crate::security::uri_validate::has_control_chars) and
+//! [`strip_control_chars`](crate::security::uri_validate::strip_control_chars)
+//! guard header values and log lines against CR/LF and other control characters
+//! (Invariants 26, 51).
+
 use http::StatusCode;
 
-/// Validate URI per Invariants 25, 62, 63
+/// Validate a request URI, rejecting encoded-traversal and malformed-encoding
+/// tricks (Invariants 25, 62, 63).
+///
+/// # Errors
+///
+/// Returns `(StatusCode::BAD_REQUEST, reason)` describing the first problem
+/// found — encoded traversal, NUL byte, alternative separator, overlong UTF-8,
+/// invalid surrogate, or invalid percent-encoding.
 pub fn validate_uri(uri: &str) -> Result<(), (StatusCode, &'static str)> {
     let lower = uri.to_lowercase();
 
@@ -42,8 +62,8 @@ pub fn validate_uri(uri: &str) -> Result<(), (StatusCode, &'static str)> {
             // Invalid surrogate halves
             if seq == "%ed" && i + 6 < bytes.len() {
                 let next = &uri[i + 3..i + 6].to_lowercase();
-                if next.starts_with('%') {
-                    let byte_val = u8::from_str_radix(&next[1..], 16).unwrap_or(0);
+                if let Some(hex) = next.strip_prefix('%') {
+                    let byte_val = u8::from_str_radix(hex, 16).unwrap_or(0);
                     if (0xa0..=0xbf).contains(&byte_val) {
                         return Err((StatusCode::BAD_REQUEST, "invalid surrogate half in URI"));
                     }
@@ -84,14 +104,24 @@ fn url_decode(s: &str) -> Option<String> {
     String::from_utf8(result).ok()
 }
 
-/// Check for control characters in header values (Invariant 26, 51)
+/// Whether `s` contains a control character (other than tab) — used to reject
+/// header values that could enable header injection (Invariants 26, 51).
+///
+/// # Examples
+///
+/// ```
+/// use flexd::security::uri_validate::has_control_chars;
+///
+/// assert!(has_control_chars("value\r\nInjected: 1"));
+/// assert!(!has_control_chars("ordinary-value"));
+/// ```
 pub fn has_control_chars(s: &str) -> bool {
     s.chars().any(|c| {
         (c as u32) < 0x20 && c != '\t' || c == '\x7f'
     })
 }
 
-/// Strip control characters for log safety (Invariant 51)
+/// Strip control characters (including CR/LF) for log safety (Invariant 51).
 pub fn strip_control_chars(s: &str) -> String {
     s.chars()
         .filter(|c| !(((*c as u32) < 0x20 && *c != '\t') || *c == '\x7f' || *c == '\n' || *c == '\r'))

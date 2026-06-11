@@ -1,7 +1,8 @@
-use crate::config::{Config, HttpBlock, MailBlock, StreamBlock};
+use crate::config::{Config, HttpBlock, ListenDirective, MailBlock, StreamBlock, TimeoutSettings};
 use crate::handler::HandlerService;
 use crate::logging::AccessLogger;
 use crate::security;
+use crate::security::rate_limit::ResetTracker;
 use crate::tls;
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -9,9 +10,9 @@ use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
@@ -73,19 +74,36 @@ fn has_bare_lf(buf: &[u8]) -> bool {
         .unwrap_or(buf.len());
     let header_section = &buf[..header_end];
     for i in 0..header_section.len() {
-        if header_section[i] == b'\n' {
-            if i == 0 || header_section[i - 1] != b'\r' {
-                return true;
-            }
+        if header_section[i] == b'\n' && (i == 0 || header_section[i - 1] != b'\r') {
+            return true;
         }
     }
     false
+}
+
+/// Resolve a listen directive to a socket address (default 0.0.0.0).
+fn listen_addr(listen: &ListenDirective) -> SocketAddr {
+    let ip: IpAddr = listen
+        .address
+        .as_deref()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    SocketAddr::new(ip, listen.port)
+}
+
+/// Default per-connection HTTP/2 reset budget when `http2_max_reset_rate` is
+/// not configured: generous for legitimate clients, fatal for Rapid Reset
+/// floods (Invariant 20).
+fn default_reset_rate() -> crate::config::ResetRateLimit {
+    crate::config::ResetRateLimit { count: 100, window_seconds: 10 }
 }
 
 pub struct Server {
     config: Arc<RwLock<Config>>,
     shutdown_tx: broadcast::Sender<()>,
     reload_tx: broadcast::Sender<()>,
+    /// Addresses actually bound (port 0 resolved); for ops and tests.
+    bound: Arc<StdMutex<Vec<SocketAddr>>>,
 }
 
 impl Server {
@@ -97,6 +115,18 @@ impl Server {
             config: Arc::new(RwLock::new(config)),
             shutdown_tx,
             reload_tx,
+            bound: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+
+    /// Addresses of listeners bound so far (TCP; resolved after `run` starts).
+    pub fn bound_addrs(&self) -> Vec<SocketAddr> {
+        self.bound.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    fn record_bound(&self, listener: &TcpListener) {
+        if let (Ok(addr), Ok(mut bound)) = (listener.local_addr(), self.bound.lock()) {
+            bound.push(addr);
         }
     }
 
@@ -105,6 +135,8 @@ impl Server {
             let guard = self.config.read().await;
             guard.clone()
         };
+        let timeouts: TimeoutSettings =
+            config_snapshot.global.timeouts.clone().unwrap_or_default();
 
         if let Some(ref pid_file) = config_snapshot.global.pid_file {
             if let Some(parent) = std::path::Path::new(pid_file).parent() {
@@ -133,57 +165,46 @@ impl Server {
             }
         }
 
-        // Bind HTTP listeners. Plain + static-TLS bind immediately; ACME-TLS
-        // listeners are deferred until issuance succeeds (invariant 76 / C58).
-        let mut bound_now: Vec<(TcpListener, HttpBlock, String, usize)> = Vec::new();
-        let mut deferred_acme_tls: Vec<(SocketAddr, HttpBlock, String, usize)> = Vec::new();
-        let mut bound_any = false;
+        // Bind every listener socket now, while still privileged. ACME-TLS
+        // listeners are *bound* here but not served until issuance succeeds
+        // (invariant 76 / C58) — deferring the bind itself used to fail for
+        // privileged ports once the daemon had dropped to `user`.
+        let mut bound_now: Vec<(TcpListener, String, usize)> = Vec::new();
+        let mut deferred_acme_tls: Vec<(TcpListener, String, usize)> = Vec::new();
+        // Pre-bound UDP sockets for QUIC listeners, keyed by block.
+        let mut quic_sockets: Vec<(std::net::UdpSocket, usize)> = Vec::new();
 
         for (idx, http_block) in config_snapshot.http.iter().enumerate() {
             let is_acme = acme_managers.contains_key(&idx);
             for listen in &http_block.listen {
-                let addr: SocketAddr = ([0, 0, 0, 0], listen.port).into();
+                let addr = listen_addr(listen);
                 match listen.protocol.as_str() {
                     "tcp" | "http" => {
                         let tcp_listener = TcpListener::bind(addr)
                             .await
                             .with_context(|| format!("Failed to bind to {}", addr))?;
+                        self.record_bound(&tcp_listener);
                         info!("Listening on {} ({})", addr, listen.protocol);
-                        bound_any = true;
-                        bound_now.push((
-                            tcp_listener,
-                            http_block.clone(),
-                            listen.protocol.clone(),
-                            idx,
-                        ));
+                        bound_now.push((tcp_listener, listen.protocol.clone(), idx));
                     }
                     "tls" | "https" => {
+                        let tcp_listener = TcpListener::bind(addr)
+                            .await
+                            .with_context(|| format!("Failed to bind to {}", addr))?;
+                        self.record_bound(&tcp_listener);
                         if is_acme {
-                            deferred_acme_tls.push((
-                                addr,
-                                http_block.clone(),
-                                listen.protocol.clone(),
-                                idx,
-                            ));
+                            info!("Bound {} ({}); serving deferred until ACME issuance", addr, listen.protocol);
+                            deferred_acme_tls.push((tcp_listener, listen.protocol.clone(), idx));
                         } else {
-                            let tcp_listener = TcpListener::bind(addr)
-                                .await
-                                .with_context(|| format!("Failed to bind to {}", addr))?;
                             info!("Listening on {} ({})", addr, listen.protocol);
-                            bound_any = true;
-                            bound_now.push((
-                                tcp_listener,
-                                http_block.clone(),
-                                listen.protocol.clone(),
-                                idx,
-                            ));
+                            bound_now.push((tcp_listener, listen.protocol.clone(), idx));
                         }
                     }
                     "quic" | "h3" | "http3" => {
-                        info!(
-                            "QUIC/HTTP3 listener on port {} (spawned separately)",
-                            listen.port
-                        );
+                        let socket = std::net::UdpSocket::bind(addr)
+                            .with_context(|| format!("Failed to bind QUIC socket on {}", addr))?;
+                        info!("QUIC/HTTP3 socket bound on {}", addr);
+                        quic_sockets.push((socket, idx));
                     }
                     other => {
                         warn!("Unknown listen protocol: {}", other);
@@ -193,60 +214,75 @@ impl Server {
         }
 
         // Bind stream (TCP proxy) listeners
+        let mut stream_listeners: Vec<(TcpListener, StreamBlock)> = Vec::new();
         for stream_block in &config_snapshot.stream {
-            let addr: SocketAddr = ([0, 0, 0, 0], stream_block.listen.port).into();
+            let addr = listen_addr(&stream_block.listen);
             let tcp_listener = TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("Failed to bind stream listener on {}", addr))?;
+            self.record_bound(&tcp_listener);
             info!("Stream proxy listening on {}", addr);
-
-            let shutdown_rx = self.shutdown_tx.subscribe();
-            let block = stream_block.clone();
-            join_set.spawn(async move {
-                Self::accept_stream_loop(tcp_listener, block, shutdown_rx).await
-            });
+            stream_listeners.push((tcp_listener, stream_block.clone()));
         }
 
         // Bind mail (SMTP/IMAP) listeners
+        let mut mail_listeners: Vec<(TcpListener, MailBlock)> = Vec::new();
         if let Some(ref mail_block) = config_snapshot.mail {
+            warn!(
+                "mail listener enabled: flexd mail support is a protocol stub \
+                 (EHLO/NOOP/QUIT only) and does NOT relay messages"
+            );
             for listen in &mail_block.listen {
-                let addr: SocketAddr = ([0, 0, 0, 0], listen.port).into();
+                let addr = listen_addr(listen);
                 let tcp_listener = TcpListener::bind(addr)
                     .await
                     .with_context(|| format!("Failed to bind mail listener on {}", addr))?;
+                self.record_bound(&tcp_listener);
                 info!("Mail ({}) listening on {}", mail_block.protocol, addr);
-
-                let shutdown_rx = self.shutdown_tx.subscribe();
-                let block = mail_block.clone();
-                join_set.spawn(async move {
-                    Self::accept_mail_loop(tcp_listener, block, shutdown_rx).await
-                });
+                mail_listeners.push((tcp_listener, mail_block.clone()));
             }
         }
 
-        if bound_any {
-            if let Some(ref user) = config_snapshot.global.user {
-                security::privilege::drop_privileges(user)
-                    .with_context(|| "Failed to drop privileges")?;
-            }
+        // All sockets are bound — drop privileges before serving anything.
+        if let Some(ref user) = config_snapshot.global.user {
+            security::privilege::drop_privileges(user)
+                .with_context(|| "Failed to drop privileges")?;
         }
 
-        // Spawn accept loops for already-bound listeners. Plain HTTP loops must
-        // be accepting before issuance so the CA can fetch HTTP-01 tokens.
-        for (tcp_listener, http_block, protocol, idx) in bound_now {
+        for (tcp_listener, stream_block) in stream_listeners {
+            let shutdown_rx = self.shutdown_tx.subscribe();
+            join_set.spawn(async move {
+                Self::accept_stream_loop(tcp_listener, stream_block, shutdown_rx).await
+            });
+        }
+
+        for (tcp_listener, mail_block) in mail_listeners {
+            let shutdown_rx = self.shutdown_tx.subscribe();
+            join_set.spawn(async move {
+                Self::accept_mail_loop(tcp_listener, mail_block, shutdown_rx).await
+            });
+        }
+
+        // Spawn accept loops for non-ACME listeners. Plain HTTP loops must be
+        // accepting before issuance so the CA can fetch HTTP-01 tokens.
+        for (tcp_listener, protocol, idx) in bound_now {
+            let Some(http_block) = config_snapshot.http.get(idx).cloned() else { continue };
             let shutdown_rx = self.shutdown_tx.subscribe();
             let reload_rx = self.reload_tx.subscribe();
             let config = Arc::clone(&self.config);
             let is_tls = protocol == "tls" || protocol == "https";
             let acme = acme_managers.get(&idx).cloned();
+            let timeouts = timeouts.clone();
 
             join_set.spawn(async move {
                 Self::accept_loop(
                     tcp_listener,
                     http_block,
+                    idx,
                     is_tls,
                     config,
                     acme,
+                    timeouts,
                     shutdown_rx,
                     reload_rx,
                 )
@@ -254,31 +290,37 @@ impl Server {
             });
         }
 
-        // QUIC/HTTP3 for non-ACME blocks (static cert) — bind now.
-        for (idx, http_block) in config_snapshot.http.iter().enumerate() {
-            if !http_block.http3 || acme_managers.contains_key(&idx) {
+        // QUIC/HTTP3 for non-ACME blocks (static cert) — serve now.
+        let mut deferred_quic: Vec<(std::net::UdpSocket, usize)> = Vec::new();
+        for (socket, idx) in quic_sockets {
+            let Some(http_block) = config_snapshot.http.get(idx) else { continue };
+            if !http_block.http3 {
                 continue;
             }
-            if let Some(ref ssl) = http_block.ssl {
-                for listen in &http_block.listen {
-                    if matches!(listen.protocol.as_str(), "quic" | "h3" | "http3") {
-                        let shutdown_rx = self.shutdown_tx.subscribe();
-                        let reload_rx = self.reload_tx.subscribe();
-                        let config = Arc::clone(&self.config);
-                        let port = listen.port;
-                        let ssl = ssl.clone();
-                        join_set.spawn(async move {
-                            Self::accept_quic_loop(port, ssl, config, None, shutdown_rx, reload_rx)
-                                .await
-                        });
-                    }
-                }
+            if acme_managers.contains_key(&idx) {
+                deferred_quic.push((socket, idx));
+                continue;
             }
+            if http_block.ssl.is_none() {
+                warn!("QUIC listener for http[{}] has no ssl block; skipping", idx);
+                continue;
+            }
+            let shutdown_rx = self.shutdown_tx.subscribe();
+            let reload_rx = self.reload_tx.subscribe();
+            let config = Arc::clone(&self.config);
+            let http_block = http_block.clone();
+            let timeouts = timeouts.clone();
+            join_set.spawn(async move {
+                Self::accept_quic_loop(
+                    socket, http_block, idx, config, None, timeouts, shutdown_rx, reload_rx,
+                )
+                .await
+            });
         }
 
-        // ACME issuance. Bind the deferred TLS (and ACME HTTP/3) listeners only
-        // on success; abort startup on failure — invariant 76 / C58 forbids any
-        // self-signed fallback.
+        // ACME issuance. Serve the pre-bound TLS (and ACME HTTP/3) listeners
+        // only on success; abort startup on failure — invariant 76 / C58
+        // forbids any self-signed fallback.
         for (idx, manager) in &acme_managers {
             if let Err(e) = manager.ensure_cert().await {
                 error!("ACME issuance failed for http[{}]: {:#}", idx, e);
@@ -289,48 +331,65 @@ impl Server {
                 );
             }
 
-            for (addr, http_block, protocol, _l) in
-                deferred_acme_tls.iter().filter(|(_, _, _, l)| l == idx)
-            {
-                let tcp_listener = TcpListener::bind(*addr)
-                    .await
-                    .with_context(|| format!("Failed to bind ACME TLS listener on {}", addr))?;
-                info!("Listening on {} ({}) [ACME]", addr, protocol);
+            let mut i = 0;
+            while i < deferred_acme_tls.len() {
+                if deferred_acme_tls[i].2 != *idx {
+                    i += 1;
+                    continue;
+                }
+                let (tcp_listener, protocol, block_idx) = deferred_acme_tls.remove(i);
+                let Some(http_block) = config_snapshot.http.get(block_idx).cloned() else {
+                    continue;
+                };
+                info!(
+                    "Serving {} ({}) [ACME]",
+                    tcp_listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                    protocol
+                );
                 let shutdown_rx = self.shutdown_tx.subscribe();
                 let reload_rx = self.reload_tx.subscribe();
                 let config = Arc::clone(&self.config);
                 let acme = Some(Arc::clone(manager));
-                let http_block = http_block.clone();
+                let timeouts = timeouts.clone();
                 join_set.spawn(async move {
                     Self::accept_loop(
-                        tcp_listener, http_block, true, config, acme, shutdown_rx, reload_rx,
+                        tcp_listener,
+                        http_block,
+                        block_idx,
+                        true,
+                        config,
+                        acme,
+                        timeouts,
+                        shutdown_rx,
+                        reload_rx,
                     )
                     .await
                 });
             }
 
             // ACME HTTP/3 (issued cert) if the block enables http3.
-            if let Some(http_block) = config_snapshot.http.get(*idx) {
-                if http_block.http3 {
-                    if let Some(ssl) = http_block.ssl.clone() {
-                        for listen in &http_block.listen {
-                            if matches!(listen.protocol.as_str(), "quic" | "h3" | "http3") {
-                                let shutdown_rx = self.shutdown_tx.subscribe();
-                                let reload_rx = self.reload_tx.subscribe();
-                                let config = Arc::clone(&self.config);
-                                let port = listen.port;
-                                let ssl = ssl.clone();
-                                let acme = Some(Arc::clone(manager));
-                                join_set.spawn(async move {
-                                    Self::accept_quic_loop(
-                                        port, ssl, config, acme, shutdown_rx, reload_rx,
-                                    )
-                                    .await
-                                });
-                            }
-                        }
-                    }
+            let mut q = 0;
+            while q < deferred_quic.len() {
+                if deferred_quic[q].1 != *idx {
+                    q += 1;
+                    continue;
                 }
+                let (socket, block_idx) = deferred_quic.remove(q);
+                let Some(http_block) = config_snapshot.http.get(block_idx).cloned() else {
+                    continue;
+                };
+                let shutdown_rx = self.shutdown_tx.subscribe();
+                let reload_rx = self.reload_tx.subscribe();
+                let config = Arc::clone(&self.config);
+                let acme = Some(Arc::clone(manager));
+                let timeouts = timeouts.clone();
+                join_set.spawn(async move {
+                    Self::accept_quic_loop(
+                        socket, http_block, block_idx, config, acme, timeouts, shutdown_rx,
+                        reload_rx,
+                    )
+                    .await
+                });
             }
 
             // Background renewal (C53).
@@ -366,12 +425,22 @@ impl Server {
         Ok(())
     }
 
+    fn build_logger(path: &str) -> Arc<AccessLogger> {
+        Arc::new(AccessLogger::new(path).unwrap_or_else(|_| {
+            let _ = std::fs::create_dir_all("./logs");
+            AccessLogger::new("./logs/access.log").expect("Failed to create fallback access log")
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn accept_loop(
         tcp_listener: TcpListener,
         http_block: HttpBlock,
+        block_idx: usize,
         is_tls: bool,
         config: Arc<RwLock<Config>>,
         acme: Option<Arc<crate::acme::AcmeManager>>,
+        mut timeouts: TimeoutSettings,
         mut shutdown_rx: broadcast::Receiver<()>,
         mut reload_rx: broadcast::Receiver<()>,
     ) -> Result<()> {
@@ -394,20 +463,13 @@ impl Server {
             }
         }
 
-        let access_logger = Arc::new(
-            AccessLogger::new(&current_http_block.access_log)
-                .unwrap_or_else(|_| {
-                    let _ = std::fs::create_dir_all("./logs");
-                    AccessLogger::new("./logs/access.log")
-                        .expect("Failed to create fallback access log")
-                }),
-        );
-
-        let mut handler = Arc::new(HandlerService::with_acme(
-            Arc::clone(&config),
+        let mut access_logger = Self::build_logger(&current_http_block.access_log);
+        let mut handler = Arc::new(HandlerService::new(
             Arc::clone(&current_http_block),
             Arc::clone(&access_logger),
             acme_store.clone(),
+            is_tls,
+            &timeouts,
         ));
 
         loop {
@@ -420,30 +482,26 @@ impl Server {
                 }
 
                 _ = reload_rx.recv() => {
-                    info!("Configuration reload triggered");
+                    info!("Configuration reload triggered for http[{}]", block_idx);
 
                     let new_config = {
                         let guard = config.read().await;
                         guard.clone()
                     };
 
-                    if let Some(new_block) = new_config.http.first() {
+                    // Refresh this listener's own block (by index), not http[0].
+                    if let Some(new_block) = new_config.http.get(block_idx) {
                         let new_block = Arc::new(new_block.clone());
-                        let new_logger = Arc::new(
-                            AccessLogger::new(&new_block.access_log)
-                                .unwrap_or_else(|_| {
-                                    let _ = std::fs::create_dir_all("./logs");
-                                    AccessLogger::new("./logs/access.log")
-                                        .expect("Failed to create fallback access log")
-                                }),
-                        );
+                        timeouts = new_config.global.timeouts.clone().unwrap_or_default();
+                        access_logger = Self::build_logger(&new_block.access_log);
 
                         current_http_block = new_block;
-                        handler = Arc::new(HandlerService::with_acme(
-                            Arc::clone(&config),
+                        handler = Arc::new(HandlerService::new(
                             Arc::clone(&current_http_block),
-                            Arc::clone(&new_logger),
+                            Arc::clone(&access_logger),
                             acme_store.clone(),
+                            is_tls,
+                            &timeouts,
                         ));
 
                         if is_tls {
@@ -464,14 +522,21 @@ impl Server {
                             }
                         }
 
-                        info!("Configuration reloaded atomically");
+                        info!("Configuration reloaded atomically for http[{}]", block_idx);
+                    } else {
+                        warn!(
+                            "Reloaded config has no http[{}]; keeping previous configuration",
+                            block_idx
+                        );
                     }
                 }
 
                 accept_result = tcp_listener.accept() => {
                     match accept_result {
                         Ok((stream, remote_addr)) => {
-                            if security::limits::check_memory_pressure(0.05) {
+                            if security::limits::check_memory_pressure(
+                                security::limits::MEMORY_PRESSURE_THRESHOLD,
+                            ) {
                                 warn!("Memory pressure detected, rejecting connection from {}", remote_addr);
                                 tokio::spawn(Self::send_503(stream));
                                 continue;
@@ -485,46 +550,61 @@ impl Server {
 
                             let handler = Arc::clone(&handler);
                             let tls_acceptor = tls_acceptor.clone();
+                            let reset_rate = current_http_block
+                                .http2_max_reset_rate
+                                .clone()
+                                .unwrap_or_else(default_reset_rate);
+                            let conn_timeouts = timeouts.clone();
 
-                            let connection_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                tokio::spawn(async move {
-                                    let _guard = ConnectionGuard;
+                            tokio::spawn(async move {
+                                let _guard = ConnectionGuard;
 
-                                    let serve_result = if let Some(acceptor) = tls_acceptor {
-                                        match acceptor.accept(stream).await {
-                                            Ok(tls_stream) => {
-                                                // C2: detect h2 via ALPN
-                                                let is_h2 = tls_stream
-                                                    .get_ref()
-                                                    .1
-                                                    .alpn_protocol()
-                                                    == Some(b"h2");
-                                                if is_h2 {
-                                                    Self::serve_http2(handler, tls_stream, remote_addr).await
-                                                } else {
-                                                    Self::serve_http1(handler, tls_stream, remote_addr).await
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!("TLS handshake failed from {}: {}", remote_addr, e);
-                                                Ok(())
+                                let serve_result = if let Some(acceptor) = tls_acceptor {
+                                    // Bound the TLS handshake so half-open
+                                    // handshakes can't pin connections.
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(10),
+                                        acceptor.accept(stream),
+                                    ).await {
+                                        Ok(Ok(tls_stream)) => {
+                                            // C2: detect h2 via ALPN
+                                            let is_h2 = tls_stream
+                                                .get_ref()
+                                                .1
+                                                .alpn_protocol()
+                                                == Some(b"h2");
+                                            if is_h2 {
+                                                Self::serve_http2(
+                                                    handler, tls_stream, remote_addr,
+                                                    reset_rate, &conn_timeouts,
+                                                ).await
+                                            } else {
+                                                Self::serve_http1(
+                                                    handler, tls_stream, remote_addr,
+                                                    &conn_timeouts,
+                                                ).await
                                             }
                                         }
-                                    } else {
-                                        // C30: peek at first 4KB, reject bare LF before hyper sees it
-                                        Self::serve_http1_with_bare_lf_check(handler, stream, remote_addr).await
-                                    };
-
-                                    if let Err(e) = serve_result {
-                                        warn!("Connection error from {}: {}", remote_addr, e);
+                                        Ok(Err(e)) => {
+                                            warn!("TLS handshake failed from {}: {}", remote_addr, e);
+                                            Ok(())
+                                        }
+                                        Err(_) => {
+                                            warn!("TLS handshake timed out from {}", remote_addr);
+                                            Ok(())
+                                        }
                                     }
-                                })
-                            }));
+                                } else {
+                                    // C30: peek at first 4KB, reject bare LF before hyper sees it
+                                    Self::serve_http1_with_bare_lf_check(
+                                        handler, stream, remote_addr, &conn_timeouts,
+                                    ).await
+                                };
 
-                            if connection_result.is_err() {
-                                error!("Handler panicked for connection from {}", remote_addr);
-                                security::limits::release_connection();
-                            }
+                                if let Err(e) = serve_result {
+                                    warn!("Connection error from {}: {}", remote_addr, e);
+                                }
+                            });
                         }
                         Err(e) => {
                             error!("Accept error: {}", e);
@@ -560,6 +640,7 @@ impl Server {
         handler: Arc<HandlerService>,
         mut stream: tokio::net::TcpStream,
         remote_addr: SocketAddr,
+        timeouts: &TimeoutSettings,
     ) -> anyhow::Result<()> {
         use tokio::io::AsyncReadExt;
         let mut peek_buf = vec![0u8; 4096];
@@ -586,13 +667,14 @@ impl Server {
         }
 
         let guard = BareLfGuard::new(stream, peek_buf[..n].to_vec(), false);
-        Self::serve_http1(handler, guard, remote_addr).await
+        Self::serve_http1(handler, guard, remote_addr, timeouts).await
     }
 
     async fn serve_http1<S>(
         handler: Arc<HandlerService>,
         stream: S,
         remote_addr: SocketAddr,
+        timeouts: &TimeoutSettings,
     ) -> anyhow::Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -607,7 +689,14 @@ impl Server {
             }
         });
 
-        hyper::server::conn::http1::Builder::new()
+        let mut builder = hyper::server::conn::http1::Builder::new();
+        builder
+            .timer(hyper_util::rt::TokioTimer::new())
+            // Slowloris defense: the full header section must arrive within
+            // the request timeout.
+            .header_read_timeout(Duration::from_secs(timeouts.request));
+
+        builder
             .serve_connection(io, service)
             .with_upgrades()
             .await?;
@@ -619,40 +708,81 @@ impl Server {
         handler: Arc<HandlerService>,
         stream: S,
         remote_addr: SocketAddr,
+        reset_rate: crate::config::ResetRateLimit,
+        timeouts: &TimeoutSettings,
     ) -> anyhow::Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let io = hyper_util::rt::TokioIo::new(stream);
-        let service = service_fn(move |req: Request<Incoming>| {
-            let handler = Arc::clone(&handler);
-            async move {
-                let resp = handler.handle(req, remote_addr).await;
-                Ok::<_, anyhow::Error>(resp)
-            }
-        });
 
-        // C19: enforce 128 concurrent stream limit per HTTP/2 connection
-        hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+        // Invariant 20: per-connection RST_STREAM tracking. hyper doesn't
+        // surface RST frames, but a request future dropped before producing a
+        // response is a stream the peer abandoned/reset; count those.
+        let tracker = Arc::new(ResetTracker::new(
+            reset_rate.count,
+            Duration::from_secs(reset_rate.window_seconds),
+        ));
+        let kill = Arc::new(tokio::sync::Notify::new());
+
+        let service = {
+            let tracker = Arc::clone(&tracker);
+            let kill = Arc::clone(&kill);
+            service_fn(move |req: Request<Incoming>| {
+                let handler = Arc::clone(&handler);
+                let mut guard = StreamDropGuard {
+                    tracker: Arc::clone(&tracker),
+                    kill: Arc::clone(&kill),
+                    completed: false,
+                };
+                async move {
+                    let resp = handler.handle(req, remote_addr).await;
+                    guard.completed = true;
+                    drop(guard);
+                    Ok::<_, anyhow::Error>(resp)
+                }
+            })
+        };
+
+        let mut builder =
+            hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        builder
+            .timer(hyper_util::rt::TokioTimer::new())
+            // C19: bounded concurrent streams per HTTP/2 connection
             .max_concurrent_streams(128)
-            .serve_connection(io, service)
-            .await?;
+            // h2's own Rapid Reset backstop (CVE-2023-44487): too many
+            // pending-accept resets ⇒ GOAWAY.
+            .max_pending_accept_reset_streams(reset_rate.count)
+            .keep_alive_interval(Some(Duration::from_secs(20)))
+            .keep_alive_timeout(Duration::from_secs(timeouts.keepalive));
+
+        let conn = builder.serve_connection(io, service);
+        tokio::pin!(conn);
+
+        tokio::select! {
+            result = conn.as_mut() => result?,
+            _ = kill.notified() => {
+                // Invariant 20: reset rate exceeded — terminate the connection.
+                warn!(
+                    "HTTP/2 stream reset rate exceeded by {}; terminating connection",
+                    remote_addr
+                );
+                conn.as_mut().graceful_shutdown();
+                let _ = conn.as_mut().await;
+            }
+        }
 
         Ok(())
     }
 
-    // C12: TCP stream proxy loop
+    // C12: TCP stream proxy loop with round-robin + connect failover.
     async fn accept_stream_loop(
         tcp_listener: TcpListener,
         stream_block: StreamBlock,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<()> {
-        let upstream_addr = stream_block
-            .upstream
-            .servers
-            .first()
-            .map(|s| s.address.clone())
-            .unwrap_or_default();
+        let balancer = Arc::new(crate::balance::Balancer::for_upstream(&stream_block.upstream));
+        let upstream = Arc::new(stream_block.upstream.clone());
 
         loop {
             tokio::select! {
@@ -663,21 +793,33 @@ impl Server {
                 }
                 accept = tcp_listener.accept() => {
                     match accept {
-                        Ok((client_stream, addr)) => {
-                            info!("Stream proxy connection from {}", addr);
-                            let upstream = upstream_addr.clone();
+                        Ok((mut client_stream, addr)) => {
+                            let balancer = Arc::clone(&balancer);
+                            let upstream = Arc::clone(&upstream);
                             tokio::spawn(async move {
-                                match tokio::net::TcpStream::connect(&upstream).await {
-                                    Ok(server_stream) => {
-                                        let (mut cr, mut cw) = tokio::io::split(client_stream);
-                                        let (mut sr, mut sw) = tokio::io::split(server_stream);
-                                        let _ = tokio::join!(
-                                            tokio::io::copy(&mut cr, &mut sw),
-                                            tokio::io::copy(&mut sr, &mut cw),
-                                        );
+                                for idx in balancer.candidates(&upstream, addr.ip()) {
+                                    let Some(server) = upstream.servers.get(idx) else { continue };
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(10),
+                                        tokio::net::TcpStream::connect(&server.address),
+                                    ).await {
+                                        Ok(Ok(mut server_stream)) => {
+                                            let _inflight = balancer.track(&upstream, idx);
+                                            let _ = tokio::io::copy_bidirectional(
+                                                &mut client_stream,
+                                                &mut server_stream,
+                                            ).await;
+                                            return;
+                                        }
+                                        _ => {
+                                            warn!(
+                                                "Stream proxy upstream {} unreachable; trying next",
+                                                server.address
+                                            );
+                                        }
                                     }
-                                    Err(e) => warn!("Stream proxy upstream connect failed: {}", e),
                                 }
+                                warn!("Stream proxy: no upstream reachable for {}", addr);
                             });
                         }
                         Err(e) => {
@@ -751,8 +893,16 @@ impl Server {
                         break;
                     } else if cmd.starts_with("EHLO") || cmd.starts_with("HELO") {
                         let _ = writer.write_all(b"250 flexd\r\n").await;
+                    } else if cmd.starts_with("NOOP") {
+                        let _ = writer.write_all(b"250 2.0.0 OK\r\n").await;
                     } else {
-                        let _ = writer.write_all(b"250 OK\r\n").await;
+                        // Honest stub: flexd does not implement mail relay.
+                        // Answering "250 OK" to MAIL/RCPT/DATA would make
+                        // senders believe messages were accepted and silently
+                        // lose them.
+                        let _ = writer
+                            .write_all(b"502 5.5.1 Command not implemented (flexd mail stub)\r\n")
+                            .await;
                     }
                     if writer.flush().await.is_err() {
                         break;
@@ -763,109 +913,130 @@ impl Server {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn accept_quic_loop(
-        port: u16,
-        ssl: crate::config::SslSettings,
+        socket: std::net::UdpSocket,
+        http_block: HttpBlock,
+        block_idx: usize,
         config: Arc<RwLock<Config>>,
         acme: Option<Arc<crate::acme::AcmeManager>>,
+        timeouts: TimeoutSettings,
         mut shutdown_rx: broadcast::Receiver<()>,
-        mut _reload_rx: broadcast::Receiver<()>,
+        mut reload_rx: broadcast::Receiver<()>,
     ) -> Result<()> {
+        let local_addr = socket.local_addr().ok();
+        let ssl = http_block
+            .ssl
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("QUIC listener requires an ssl block"))?;
+
         let quic_config = match acme {
             Some(ref mgr) => {
                 tls::build_quinn_server_config_from_paths(&mgr.cert_path(), &mgr.key_path())
             }
             None => tls::build_quinn_server_config(&ssl),
         }
-        .with_context(|| format!("Failed to build QUIC config for port {}", port))?;
+        .with_context(|| format!("Failed to build QUIC config for {:?}", local_addr))?;
 
-        let endpoint = quinn::Endpoint::server(
-            quic_config,
-            SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port),
+        socket
+            .set_nonblocking(true)
+            .with_context(|| "Failed to set QUIC socket non-blocking")?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(quic_config),
+            socket,
+            quinn::default_runtime()
+                .ok_or_else(|| anyhow::anyhow!("no async runtime for QUIC endpoint"))?,
         )
-        .with_context(|| format!("Failed to bind QUIC endpoint on port {}", port))?;
+        .with_context(|| format!("Failed to create QUIC endpoint on {:?}", local_addr))?;
 
-        info!("QUIC listener on port {}", port);
+        info!("QUIC listener serving on {:?}", local_addr);
 
-        let access_logger = Arc::new(
-            AccessLogger::new("./logs/access.log")
-                .unwrap_or_else(|_| {
-                    let _ = std::fs::create_dir_all("./logs");
-                    AccessLogger::new("./logs/access.log")
-                        .expect("Failed to create fallback access log")
-                }),
-        );
+        // Per-block logger/handler (previously hardcoded ./logs/access.log
+        // and http[0]); rebuilt on reload like the TCP loops.
+        let mut current_block = Arc::new(http_block);
+        let mut access_logger = Self::build_logger(&current_block.access_log);
+        let mut handler = Arc::new(HandlerService::new(
+            Arc::clone(&current_block),
+            Arc::clone(&access_logger),
+            None,
+            true, // QUIC is always TLS
+            &timeouts,
+        ));
 
-        let http_block = {
-            let guard = config.read().await;
-            guard.http.first().cloned()
-        };
+        loop {
+            tokio::select! {
+                biased;
 
-        if let Some(http_block) = http_block {
-            let http_block = Arc::new(http_block);
-            let handler = Arc::new(HandlerService::new(
-                Arc::clone(&config),
-                Arc::clone(&http_block),
-                Arc::clone(&access_logger),
-            ));
+                _ = shutdown_rx.recv() => {
+                    info!("Shutdown signal received, stopping QUIC accept loop");
+                    break;
+                }
 
-            loop {
-                tokio::select! {
-                    _ = shutdown_rx.recv() => {
-                        info!("Shutdown signal received, stopping QUIC accept loop");
-                        break;
+                _ = reload_rx.recv() => {
+                    let new_config = {
+                        let guard = config.read().await;
+                        guard.clone()
+                    };
+                    if let Some(new_block) = new_config.http.get(block_idx) {
+                        current_block = Arc::new(new_block.clone());
+                        access_logger = Self::build_logger(&current_block.access_log);
+                        let new_timeouts = new_config.global.timeouts.clone().unwrap_or_default();
+                        handler = Arc::new(HandlerService::new(
+                            Arc::clone(&current_block),
+                            Arc::clone(&access_logger),
+                            None,
+                            true,
+                            &new_timeouts,
+                        ));
+                        info!("QUIC configuration reloaded for http[{}]", block_idx);
+                    }
+                }
+
+                connecting = endpoint.accept() => {
+                    let Some(connecting) = connecting else {
+                        continue;
+                    };
+
+                    if security::limits::check_memory_pressure(
+                        security::limits::MEMORY_PRESSURE_THRESHOLD,
+                    ) {
+                        warn!("Memory pressure, rejecting QUIC connection");
+                        continue;
                     }
 
-                    connecting = endpoint.accept() => {
-                        let Some(connecting) = connecting else {
-                            continue;
-                        };
+                    if !security::limits::acquire_connection() {
+                        warn!("QUIC connection limit reached");
+                        continue;
+                    }
 
-                        if security::limits::check_memory_pressure(0.05) {
-                            warn!("Memory pressure, rejecting QUIC connection");
-                            continue;
-                        }
+                    let handler = Arc::clone(&handler);
 
-                        if !security::limits::acquire_connection() {
-                            warn!("QUIC connection limit reached");
-                            continue;
-                        }
+                    let max_body = current_block.max_body_size.unwrap_or(10 * 1024 * 1024);
+                    // Invariant 21 / 31: bound the HTTP/3 field section size.
+                    let max_field = current_block
+                        .http3_max_dynamic_table_size
+                        .unwrap_or(65536) as u64;
 
-                        let handler = Arc::clone(&handler);
+                    tokio::spawn(async move {
+                        let _guard = ConnectionGuard;
 
-                        let max_body = http_block.max_body_size.unwrap_or(1024 * 1024);
-                        // Invariant 21 / 31: bound the HTTP/3 field section size.
-                        let max_field = http_block
-                            .http3_max_dynamic_table_size
-                            .unwrap_or(65536) as u64;
-
-                        let connection_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            tokio::spawn(async move {
-                                let _guard = ConnectionGuard;
-
-                                match connecting.await {
-                                    Ok(connection) => {
-                                        let remote = connection.remote_address();
-                                        if let Err(e) = Self::serve_http3(
-                                            handler, connection, remote, max_body, max_field,
-                                        )
-                                        .await
-                                        {
-                                            warn!("HTTP/3 connection error from {}: {}", remote, e);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("QUIC connection failed: {}", e);
-                                    }
+                        match connecting.await {
+                            Ok(connection) => {
+                                let remote = connection.remote_address();
+                                if let Err(e) = Self::serve_http3(
+                                    handler, connection, remote, max_body, max_field,
+                                )
+                                .await
+                                {
+                                    warn!("HTTP/3 connection error from {}: {}", remote, e);
                                 }
-                            })
-                        }));
-
-                        if connection_result.is_err() {
-                            error!("QUIC handler panicked");
-                            security::limits::release_connection();
+                            }
+                            Err(e) => {
+                                warn!("QUIC connection failed: {}", e);
+                            }
                         }
-                    }
+                    });
                 }
             }
         }
@@ -933,10 +1104,11 @@ impl Server {
                         }
 
                         let resp = if overflow {
-                            Response::builder()
-                                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                                .body(Full::new(Bytes::from("413 Payload Too Large\n")))
-                                .unwrap()
+                            let mut resp = Response::new(Full::new(Bytes::from(
+                                "413 Payload Too Large\n",
+                            )));
+                            *resp.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
+                            resp
                         } else {
                             handler.handle_h3(req, body.freeze(), remote).await
                         };
@@ -971,7 +1143,7 @@ impl Server {
     /// C53 — background certificate renewal. Periodically checks whether the
     /// issued cert is within `renewal_window` days of expiry and, if so,
     /// re-issues and signals a reload so accept loops hot-swap the new cert
-    /// without dropping active connections. (Body implemented in Phase 6.)
+    /// without dropping active connections.
     async fn acme_renewal_loop(
         manager: Arc<crate::acme::AcmeManager>,
         reload_tx: broadcast::Sender<()>,
@@ -1085,5 +1257,22 @@ struct ConnectionGuard;
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         security::limits::release_connection();
+    }
+}
+
+/// Records a dropped (never-completed) HTTP/2 request future as a peer stream
+/// reset and trips the connection kill switch past the configured rate
+/// (Invariant 20).
+struct StreamDropGuard {
+    tracker: Arc<ResetTracker>,
+    kill: Arc<tokio::sync::Notify>,
+    completed: bool,
+}
+
+impl Drop for StreamDropGuard {
+    fn drop(&mut self) {
+        if !self.completed && self.tracker.record_reset() {
+            self.kill.notify_waiters();
+        }
     }
 }

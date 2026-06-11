@@ -236,11 +236,11 @@ impl AcmeManager {
         Duration::from_secs(self.cfg.renewal_check_interval_secs.unwrap_or(3600))
     }
 
-    /// Whether a loadable cert + key already exist on disk.
+    /// Whether a loadable cert + key already exist on disk. A single load
+    /// attempt is the check — separate exists()/parse() steps had a
+    /// check-to-use window, and missing files simply fail the load.
     fn has_usable_cert(&self) -> bool {
-        std::path::Path::new(&self.cert_path()).exists()
-            && std::path::Path::new(&self.key_path()).exists()
-            && load_certified_key(&self.cert_path(), &self.key_path()).is_ok()
+        load_certified_key(&self.cert_path(), &self.key_path()).is_ok()
     }
 
     /// C53 / invariant 75-aware: true if the issued cert is within
@@ -404,7 +404,8 @@ impl AcmeManager {
                 .map_err(map_acme_err)
                 .context("set challenge ready")?;
         }
-        drop(authorizations);
+        // End the mutable borrow of `order` held by the authorizations iterator.
+        let _ = authorizations;
 
         let status = order
             .poll_ready(&RetryPolicy::default())

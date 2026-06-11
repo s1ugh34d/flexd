@@ -1,3 +1,15 @@
+//! flexd command-line entry point.
+//!
+//! This binary is deliberately thin: it parses arguments, installs the rustls
+//! crypto provider and the tracing subscriber, loads and validates the
+//! configuration, and hands off to [`flexd::server::Server`]. All real logic
+//! lives in the [`flexd`] library so it can be tested without a socket.
+//!
+//! ```text
+//! flexd --config flexd.conf --test   # validate config and exit
+//! flexd --config flexd.conf          # run
+//! ```
+
 use anyhow::Result;
 use clap::Parser;
 use flexd::config::Config;
@@ -5,13 +17,16 @@ use flexd::server::Server;
 use std::path::PathBuf;
 use tracing::info;
 
+/// Parsed command-line arguments.
 #[derive(Parser, Debug)]
 #[command(name = "flexd")]
 #[command(about = "flexd - hardened web server", long_about = None)]
 struct Args {
+    /// Path to the configuration file. Defaults to `./flexd.conf`.
     #[arg(long, help = "Path to configuration file")]
     config: Option<PathBuf>,
 
+    /// Validate the configuration and exit without serving.
     #[arg(long, help = "Test configuration and exit")]
     test: bool,
 }
