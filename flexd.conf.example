@@ -1,0 +1,113 @@
+# flexd.conf — example configuration
+#
+# Copy to flexd.conf and adjust. Run with:
+#   flexd --config flexd.conf
+# Validate without starting:
+#   flexd --config flexd.conf --test
+#
+# Paths are resolved relative to the working directory flexd is started from.
+
+[global]
+worker_processes = "auto"          # or an integer
+error_log = "./logs/error.log"
+# pid_file = "./flexd.pid"
+# user = "www-data"                # drop privileges after binding (requires root)
+# http_downgrade_policy = "validate"
+
+# [global.timeouts]
+# idle = 75
+# request = 30
+# keepalive = 75
+# proxy_read = 60
+
+# ── HTTP server ────────────────────────────────────────────────────────────────
+
+[[http]]
+server_name = ["example.com", "www.example.com"]
+root = "./public"
+access_log = "./logs/access.log"
+
+# Host-header policy: "strict" (default — only server_name values accepted) or "any"
+host_header_policy = "strict"
+
+# Upstream targets resolving to loopback/private ranges must be explicitly allowed.
+# upstream_allowed_networks = ["127.0.0.0/8"]
+
+# Request limits (bytes)
+# max_header_size = 16384
+# max_header_count = 100
+# max_body_size = 10485760
+
+[[http.listen]]
+port = 8080
+protocol = "tcp"
+
+# ── Static files ───────────────────────────────────────────────────────────────
+
+[[http.locations]]
+pattern = "/"
+match_type = "prefix"
+
+[http.locations.handler]
+type = "static"
+root = "./public"
+
+# ── Reverse proxy ──────────────────────────────────────────────────────────────
+
+[[http.locations]]
+pattern = "/api/"
+match_type = "prefix"
+
+[http.locations.handler]
+type = "proxy"
+
+[http.locations.handler.upstream]
+name = "backend"
+strategy = "round-robin"
+
+[[http.locations.handler.upstream.servers]]
+address = "127.0.0.1:3000"
+weight = 1
+
+# ── HTTPS with ACME (Let's Encrypt) ────────────────────────────────────────────
+# Uncomment and adjust. flexd obtains and renews certificates automatically.
+#
+# [[http]]
+# server_name = ["example.com"]
+# root = "./public"
+# http2 = true
+# http3 = true                      # QUIC; listen protocol below must include udp
+#
+# [[http.listen]]
+# port = 443
+# protocol = "tcp"
+#
+# [http.ssl]
+# protocols = ["TLSv1.2", "TLSv1.3"]
+#
+# [http.ssl.acme]
+# enabled = true
+# email = "admin@example.com"
+# domains = ["example.com"]
+# agree_tos = true
+# staging = false                   # true = Let's Encrypt staging CA
+# challenge_types = ["http-01", "tls-alpn-01"]
+# cert_dir = "./acme"               # issued cert/key persisted here (mode 0600)
+# renewal_window = 30               # days before expiry to renew
+#
+# Static certificate instead of ACME:
+# [http.ssl]
+# certificate = "./certs/example.com.pem"
+# certificate_key = "./certs/example.com.key"
+
+# ── TCP stream proxy ───────────────────────────────────────────────────────────
+#
+# [[stream]]
+# [stream.listen]
+# port = 5432
+# protocol = "tcp"
+#
+# [stream.upstream]
+# name = "db"
+# [[stream.upstream.servers]]
+# address = "10.0.0.5:5432"

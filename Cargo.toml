@@ -1,0 +1,55 @@
+[package]
+name = "flexd"
+version = "0.2.3"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
+description = "Hardened web server and reverse proxy: TLS/HTTP3, ACME, rate limiting, host policy, GeoIP, A/B splitting, privilege dropping"
+readme = "README.md"
+keywords = ["web-server", "reverse-proxy", "tls", "acme", "http3"]
+categories = ["web-programming::http-server", "network-programming"]
+
+[lib]
+name = "flexd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flexd"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.52", features = ["full"] }
+hyper = { version = "1.9", features = ["full"] }
+hyper-util = { version = "0.1.20", features = ["full"] }
+http-body-util = "0.1.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+regex = "1.12"
+clap = { version = "4.6", features = ["derive"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+anyhow = "1.0"
+maxminddb = "0.28"
+bytes = "1.11"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2.2"
+tokio-rustls = "0.26"
+quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+instant-acme = "0.8"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12"] }
+webpki-roots = "0.26"
+base64 = "0.22"
+x509-parser = "0.18"
+http = "1"
+nix = { version = "0.29", features = ["user", "fs"] }
+ipnetwork = "0.21"
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json", "gzip"] }
+flate2 = "1.1"
+
+[dev-dependencies]
+proptest = "1"
