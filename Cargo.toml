@@ -8,6 +8,7 @@ description = "Hardened web server and reverse proxy: TLS/HTTP3, ACME, rate limi
 readme = "README.md"
 keywords = ["web-server", "reverse-proxy", "tls", "acme", "http3"]
 categories = ["web-programming::http-server", "network-programming"]
+documentation = "https://docs.rs/flexd"
 exclude = ["*.osc.md", "proptest-regressions"]
 
 [lib]
