@@ -9,6 +9,7 @@ readme = "README.md"
 keywords = ["web-server", "reverse-proxy", "tls", "acme", "http3"]
 categories = ["web-programming::http-server", "network-programming"]
 documentation = "https://docs.rs/flexd"
+repository = "https://github.com/s1ugh34d/flexd"
 exclude = ["*.osc.md", "proptest-regressions"]
 
 [lib]
